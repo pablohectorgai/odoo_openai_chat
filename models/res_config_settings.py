@@ -17,7 +17,7 @@ class ResConfigSettings(models.TransientModel):
     openai_timeout = fields.Integer(string='Timeout (s)', default=60, config_parameter='openai_chat.timeout')
     openai_system_prompt = fields.Char(string='System prompt', config_parameter='openai_chat.system_prompt', help='Prompt del sistema para OpenAI')
 
-     def action_test_openai(self):
+    def action_test_openai(self):
         self.ensure_one()
         ICP = self.env['ir.config_parameter'].sudo()
         api_key = ICP.get_param('openai_chat.api_key')
