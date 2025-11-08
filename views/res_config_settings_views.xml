@@ -19,7 +19,7 @@
                                     <div class="text-muted">
                                         Activa el comando /ai en Discuss y conversación 1:1 con el bot
                                     </div>
-                                    <div class="content-group" invisible="[('openai_enabled','=',False)]">
+                                    <group class="content-group" invisible="[('openai_enabled','=',False)]">
                                         <field name="openai_api_key" password="True"/>
                                         <field name="openai_organization"/>
                                         <field name="openai_base_url"/>
@@ -28,7 +28,7 @@
                                         <field name="openai_context_count"/>
                                         <field name="openai_timeout"/>
                                         <field name="openai_system_prompt" placeholder="Eres un asistente útil para usuarios de Odoo..."/>
-                                    </div>
+                                    </group>
                                 </div>
                             </div>
                         </div>
