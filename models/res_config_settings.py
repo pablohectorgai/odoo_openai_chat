@@ -7,6 +7,16 @@ _logger = logging.getLogger(__name__)
 class ResConfigSettings(models.TransientModel):
     _inherit = 'res.config.settings'
 
+    openai_enabled = fields.Boolean(string='Habilitar OpenAI Chat', config_parameter='openai_chat.enabled')
+    openai_api_key = fields.Char(string='OpenAI API Key', config_parameter='openai_chat.api_key')
+    openai_organization = fields.Char(string='OpenAI Organization', config_parameter='openai_chat.organization')
+    openai_base_url = fields.Char(string='OpenAI Base URL', default='https://api.openai.com/v1', config_parameter='openai_chat.base_url')
+    openai_model = fields.Char(string='Modelo', default='gpt-4o-mini', config_parameter='openai_chat.model')
+    openai_temperature = fields.Float(string='Temperature', default=0.2, config_parameter='openai_chat.temperature')
+    openai_context_count = fields.Integer(string='Contexto (mensajes)', default=10, config_parameter='openai_chat.context_count')
+    openai_timeout = fields.Integer(string='Timeout (s)', default=60, config_parameter='openai_chat.timeout')
+    openai_system_prompt = fields.Text(string='System prompt', config_parameter='openai_chat.system_prompt')
+
     openai_enabled = fields.Boolean(
         string='Habilitar OpenAI en Discuss',
         config_parameter='openai_chat.enabled',
