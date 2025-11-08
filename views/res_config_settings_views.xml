@@ -19,15 +19,23 @@
                                     <div class="text-muted">
                                         Activa el comando /ai en Discuss y conversación 1:1 con el bot
                                     </div>
-                                    <group name="openai_settings_group" >
-                                        <field name="openai_api_key" password="True"/>
+
+                                    <group name="openai_settings_group" invisible="[('openai_enabled','=',False)]">
+                                        <field name="openai_api_key" widget="password"/>
                                         <field name="openai_organization"/>
                                         <field name="openai_base_url"/>
+                                        <field name="openai_timeout"/>
                                         <field name="openai_model"/>
                                         <field name="openai_temperature"/>
                                         <field name="openai_context_count"/>
-                                        <field name="openai_timeout"/>
                                         <field name="openai_system_prompt" placeholder="Eres un asistente útil para usuarios de Odoo..."/>
+
+                                        <separator string="Modo de agente"/>
+                                        <field name="openai_agent_mode"/>
+                                        <field name="openai_assistant_id" attrs="{'invisible':[('openai_agent_mode','!=','assistants')]}"/>
+                                        <field name="openai_agent_instructions" placeholder="Instrucciones del agente (Agent Builder / Runner)" attrs="{'invisible':[('openai_agent_mode','!=','agents')]}"/>
+
+                                        <button name="action_test_openai" type="object" string="Probar conexión" class="btn btn-secondary"/>
                                     </group>
                                 </div>
                             </div>
