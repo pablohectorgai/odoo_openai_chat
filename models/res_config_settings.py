@@ -15,7 +15,7 @@ class ResConfigSettings(models.TransientModel):
     openai_temperature = fields.Float(string='Temperature', default=0.2, config_parameter='openai_chat.temperature')
     openai_context_count = fields.Integer(string='Contexto (mensajes)', default=10, config_parameter='openai_chat.context_count')
     openai_timeout = fields.Integer(string='Timeout (s)', default=60, config_parameter='openai_chat.timeout')
-    openai_system_prompt = fields.Text(string='System prompt', config_parameter='openai_chat.system_prompt')
+    openai_system_prompt = fields.Char(string='System prompt', config_parameter='openai_chat.system_prompt', help='Prompt del sistema para OpenAI')
 
     openai_enabled = fields.Boolean(
         string='Habilitar OpenAI en Discuss',
