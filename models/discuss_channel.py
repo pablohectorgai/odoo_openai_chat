@@ -1,8 +1,7 @@
-# -*- coding: utf-8 -*-
 import logging
 import re
 import requests
-
+import odoo
 from odoo import api, fields, models, tools, _
 from odoo.exceptions import UserError
 
@@ -13,6 +12,10 @@ AI_PARTNER_EMAIL = 'assistant@openai.local'
 
 class DiscussChannel(models.Model):
     _inherit = 'discuss.channel'  # Odoo 17
+
+    # Contexto por canal
+    openai_thread_id = fields.Char(string='OpenAI Thread ID (Assistants v2)')
+    openai_agent_conversation_id = fields.Char(string='OpenAI Agent Conversation ID (Runner)')
 
     def message_post(self, **kwargs):
         # Evita recursión cuando el bot publica
@@ -29,7 +32,7 @@ class DiscussChannel(models.Model):
             if not self._openai_is_enabled():
                 return message
 
-            # Detectar trigger /ai
+            # Detectar trigger (/ai o /iaMeta)
             trigger, user_prompt = self._detect_ai_trigger(body_plain)
 
             # O conversación 1:1 con el bot
@@ -40,7 +43,7 @@ class DiscussChannel(models.Model):
                     trigger = True
                     user_prompt = body_plain
 
-            if not trigger:
+            if not trigger or not user_prompt:
                 return message
 
             cfg = self._get_openai_config()
@@ -50,28 +53,149 @@ class DiscussChannel(models.Model):
 
             ai_partner = self._get_or_create_ai_partner()
 
-            messages_payload = self._prepare_openai_chat_messages(
-                user_prompt=user_prompt,
-                ai_partner=ai_partner,
-                cfg=cfg,
-                exclude_message_id=message.id
-            )
-
-            reply_text = self._call_openai_chat(messages_payload=messages_payload, cfg=cfg) or \
-                         _('No se pudo obtener respuesta del modelo.')
-
-            # Publicar respuesta del bot
-            self.with_context(openai_skip=True).message_post(
-                body=tools.plaintext2html(reply_text),
+            # Placeholder visible de inmediato
+            placeholder = self.with_context(openai_skip=True).message_post(
+                body=tools.plaintext2html(_("Generando respuesta...")),
                 author_id=ai_partner.id,
                 message_type='comment',
                 subtype_xmlid='mail.mt_comment',
             )
+            # COMMIT para que el bus notifique sin refrescar
+            self.env.cr.commit()
+
+            # Lanza worker en background
+            self._ai_reply_async(self.id, user_prompt, message.id, ai_partner.id)
+
         except Exception as e:
             _logger.exception('Error al procesar respuesta de OpenAI: %s', e)
             self._post_ai_error(_('Error al procesar la respuesta de OpenAI: %s') % e, as_thread=True)
 
         return message
+
+    # ---------------------------
+    # Worker async (thread)
+    # ---------------------------
+    def _ai_reply_async(self, channel_id, prompt, last_user_message_id, ai_partner_id):
+        import threading
+        from odoo import api, SUPERUSER_ID
+
+        dbname = self.env.cr.dbname
+
+        def _worker():
+            with api.Environment.manage():
+                registry = odoo.registry(dbname)
+                with registry.cursor() as cr:
+                    env = api.Environment(cr, SUPERUSER_ID, {})
+                    channel = env['discuss.channel'].browse(channel_id)
+
+                    try:
+                        reply = channel._generate_ai_reply(prompt, exclude_message_id=last_user_message_id)
+                    except Exception as e:
+                        _logger.exception('AI worker error: %s', e)
+                        reply = _("No se pudo obtener respuesta del modelo.")
+
+                    try:
+                        channel.with_context(openai_skip=True).message_post(
+                            body=tools.plaintext2html(reply),
+                            author_id=ai_partner_id,
+                            message_type='comment',
+                            subtype_xmlid='mail.mt_comment',
+                        )
+                        cr.commit()  # imprescindible para que el bus empuje el mensaje
+                    except Exception:
+                        _logger.exception('No se pudo publicar la respuesta del bot')
+
+        threading.Thread(target=_worker, name=f'openai_ai_reply_{channel_id}', daemon=True).start()
+
+    def _generate_ai_reply(self, prompt, exclude_message_id=None):
+        """
+        Decide el modo: Agents SDK > Assistants v2 > Chat Completions.
+        """
+        ICP = self.env['ir.config_parameter'].sudo()
+        mode = (ICP.get_param('openai_chat.agent_mode') or 'chat').lower()
+
+        # 1) Agents SDK (Runner)
+        if mode in ('agents', 'agents_sdk'):
+            try:
+                from ..services.agents_runner import run_agent_for_channel
+                return run_agent_for_channel(self.env, self, prompt)
+            except Exception as e:
+                _logger.warning('Fallo Agents SDK, fallback a siguiente modo: %s', e)
+
+        # 2) Assistants v2
+        assistant_id = ICP.get_param('openai_chat.assistant_id')
+        if mode == 'assistants' and assistant_id:
+            try:
+                return self._assistants_reply(prompt)
+            except Exception as e:
+                _logger.warning('Fallo Assistants v2, fallback a Chat: %s', e)
+
+        # 3) Chat Completions (fallback)
+        cfg = self._get_openai_config()
+        messages_payload = self._prepare_openai_chat_messages(
+            user_prompt=prompt,
+            ai_partner=self._get_or_create_ai_partner(),
+            cfg=cfg,
+            exclude_message_id=exclude_message_id
+        )
+        return self._call_openai_chat(messages_payload=messages_payload, cfg=cfg) or _('No se pudo obtener respuesta del modelo.')
+
+    # ---------------------------
+    # Assistants v2
+    # ---------------------------
+    def _assistants_reply(self, user_content):
+        ICP = self.env['ir.config_parameter'].sudo()
+        api_key = ICP.get_param('openai_chat.api_key')
+        base_url = (ICP.get_param('openai_chat.base_url') or 'https://api.openai.com/v1').rstrip('/')
+        assistant_id = ICP.get_param('openai_chat.assistant_id')
+        timeout = int(ICP.get_param('openai_chat.timeout') or 60)
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "OpenAI-Beta": "assistants=v2",
+        }
+
+        thread_id = self.openai_thread_id
+        if not thread_id:
+            r = requests.post(f"{base_url}/threads", headers=headers, json={}, timeout=timeout)
+            r.raise_for_status()
+            thread_id = r.json()['id']
+            self.sudo().write({'openai_thread_id': thread_id})
+            self.env.cr.commit()
+
+        r = requests.post(f"{base_url}/threads/{thread_id}/messages", headers=headers, json={"role": "user", "content": user_content}, timeout=timeout)
+        r.raise_for_status()
+        r = requests.post(f"{base_url}/threads/{thread_id}/runs", headers=headers, json={"assistant_id": assistant_id}, timeout=timeout)
+        r.raise_for_status()
+        run = r.json()
+        run_id = run['id']
+
+        import time
+        start = time.time()
+        while run['status'] in ('queued', 'in_progress', 'requires_action'):
+            if time.time() - start > timeout:
+                raise UserError(_('Timeout esperando respuesta del Assistant'))
+            time.sleep(0.8)
+            r = requests.get(f"{base_url}/threads/{thread_id}/runs/{run_id}", headers=headers, timeout=timeout)
+            r.raise_for_status()
+            run = r.json()
+
+        if run['status'] != 'completed':
+            raise UserError(_('Run terminó en estado %s') % run['status'])
+
+        r = requests.get(f"{base_url}/threads/{thread_id}/messages", headers=headers, params={"order": "desc", "limit": 10}, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        for msg in data.get('data', []):
+            if msg.get('role') == 'assistant':
+                parts = []
+                for cpart in msg.get('content', []):
+                    if cpart.get('type') == 'text':
+                        parts.append(cpart['text']['value'])
+                if parts:
+                    return '\n'.join(parts)
+        return ''
 
     # ---------------------------
     # Helpers de configuración
@@ -99,9 +223,9 @@ class DiscussChannel(models.Model):
     def _detect_ai_trigger(self, body_plain):
         if not body_plain:
             return False, ''
-        m = re.match(r'^\s*/iaMeta\s*(.*)$', body_plain, re.S | re.I)
+        m = re.match(r'^\s*/(ai|iaMeta)\s*(.*)$', body_plain, re.S | re.I)
         if m:
-            return True, (m.group(1) or '').strip()
+            return True, (m.group(2) or '').strip()
         return False, ''
 
     def _get_channel_partners(self):
@@ -113,11 +237,8 @@ class DiscussChannel(models.Model):
         return self.env['res.partner']
 
     def _is_dm_with_ai_bot(self):
-        """
-        True si el canal es un chat 1:1 entre el usuario y el bot
-        """
+        """True si el canal es un chat 1:1 entre el usuario y el bot."""
         self.ensure_one()
-        # En v17 se mantiene channel_type='chat' para DM
         if getattr(self, 'channel_type', None) != 'chat':
             return False
         partners = self._get_channel_partners()
@@ -127,17 +248,15 @@ class DiscussChannel(models.Model):
         return ai_partner in partners
 
     # ---------------------------
-    # OpenAI: preparación y llamada
+    # Chat Completions (fallback)
     # ---------------------------
     def _prepare_openai_chat_messages(self, user_prompt, ai_partner, cfg, exclude_message_id=None):
         self.ensure_one()
-
         messages = []
         system_prompt = (cfg.get('system_prompt') or '').strip()
         if system_prompt:
             messages.append({'role': 'system', 'content': system_prompt})
 
-        # Usar el modelo actual (discuss.channel) para el histórico
         domain = [
             ('model', '=', self._name),
             ('res_id', '=', self.id),
@@ -149,7 +268,7 @@ class DiscussChannel(models.Model):
 
         last_msgs = self.env['mail.message'].sudo().search(domain, order='id desc', limit=cfg['context_count'])
         for msg in reversed(last_msgs):
-            role = 'assistant' if (msg.author_id and msg.author_id.id == ai_partner.id) else 'user'
+            role = 'assistant' if (msg.author_id and msg.author_id.email == AI_PARTNER_EMAIL) else 'user'
             content = tools.html2plaintext(msg.body or '').strip()
             if not content:
                 continue
@@ -174,7 +293,6 @@ class DiscussChannel(models.Model):
             'messages': messages_payload,
             'temperature': cfg['temperature'],
         }
-
         _logger.debug('OpenAI request to %s: %s', url, payload)
 
         resp = requests.post(url, json=payload, headers=headers, timeout=cfg['timeout'])
