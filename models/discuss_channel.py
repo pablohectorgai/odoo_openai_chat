@@ -99,7 +99,7 @@ class DiscussChannel(models.Model):
     def _detect_ai_trigger(self, body_plain):
         if not body_plain:
             return False, ''
-        m = re.match(r'^\s*/ai\s*(.*)$', body_plain, re.S | re.I)
+        m = re.match(r'^\s*/iaMeta\s*(.*)$', body_plain, re.S | re.I)
         if m:
             return True, (m.group(1) or '').strip()
         return False, ''
