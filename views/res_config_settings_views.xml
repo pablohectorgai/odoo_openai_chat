@@ -3,7 +3,7 @@
     <record id="res_config_settings_view_form_openai" model="ir.ui.view">
         <field name="name">res.config.settings.view.form.openai.chat</field>
         <field name="model">res.config.settings</field>
-        <field name="inherit_id" ref="base.view_res_config_settings"/>
+        <field name="inherit_id" ref="base.view_general_configuration"/>
         <field name="arch" type="xml">
             <xpath expr="//div[@id='settings']" position="inside">
                 <div class="app_settings_block" data-string="OpenAI Chat" string="OpenAI Chat" name="openai_chat_settings">
