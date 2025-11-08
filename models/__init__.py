@@ -1,2 +1,2 @@
 from . import res_config_settings
-from . import mail_channel
+from . import discuss_channel
