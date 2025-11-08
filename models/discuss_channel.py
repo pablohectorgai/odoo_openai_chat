@@ -8,35 +8,32 @@ from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
 
-AI_PARTNER_XMLID = 'openai_chat.partner_ai'  # si luego quieres crear por XML
 AI_PARTNER_NAME = 'AI Assistant'
 AI_PARTNER_EMAIL = 'assistant@openai.local'
 
-class MailChannel(models.Model):
-    _inherit = 'mail.channel'
+class DiscussChannel(models.Model):
+    _inherit = 'discuss.channel'  # Odoo 17
 
     def message_post(self, **kwargs):
-        # Guard para evitar recursión al publicar respuesta del bot
+        # Evita recursión cuando el bot publica
         if self.env.context.get('openai_skip'):
-            return super(MailChannel, self).message_post(**kwargs)
+            return super(DiscussChannel, self).message_post(**kwargs)
 
         body_html = kwargs.get('body') or ''
         body_plain = tools.html2plaintext(body_html or '').strip()
 
         # Post original del usuario
-        message = super(MailChannel, self).message_post(**kwargs)
+        message = super(DiscussChannel, self).message_post(**kwargs)
 
         try:
             if not self._openai_is_enabled():
                 return message
 
-            # Detectar trigger: /ai en cualquier canal
+            # Detectar trigger /ai
             trigger, user_prompt = self._detect_ai_trigger(body_plain)
 
-            # O conversación 1:1 con el bot (sin /ai)
+            # O conversación 1:1 con el bot
             if not trigger and self._is_dm_with_ai_bot():
-                # En chat 1:1 con el bot, cualquier mensaje del usuario dispara respuesta
-                # exceptuando mensajes del propio bot.
                 author_partner_id = kwargs.get('author_id') or self.env.user.partner_id.id
                 ai_partner = self._get_or_create_ai_partner()
                 if author_partner_id != ai_partner.id:
@@ -46,7 +43,6 @@ class MailChannel(models.Model):
             if not trigger:
                 return message
 
-            # Construción del contexto y llamada a OpenAI
             cfg = self._get_openai_config()
             if not cfg.get('api_key'):
                 self._post_ai_error(_('Falta el API Key de OpenAI en Ajustes'), as_thread=True)
@@ -54,14 +50,15 @@ class MailChannel(models.Model):
 
             ai_partner = self._get_or_create_ai_partner()
 
-            # Preparar mensajes para Chat Completions
-            messages_payload = self._prepare_openai_chat_messages(user_prompt=user_prompt, ai_partner=ai_partner, cfg=cfg, exclude_message_id=message.id)
+            messages_payload = self._prepare_openai_chat_messages(
+                user_prompt=user_prompt,
+                ai_partner=ai_partner,
+                cfg=cfg,
+                exclude_message_id=message.id
+            )
 
-            # Llamada a OpenAI Chat Completions
-            reply_text = self._call_openai_chat(messages_payload=messages_payload, cfg=cfg)
-
-            if not reply_text:
-                reply_text = _('No se pudo obtener respuesta del modelo.')
+            reply_text = self._call_openai_chat(messages_payload=messages_payload, cfg=cfg) or \
+                         _('No se pudo obtener respuesta del modelo.')
 
             # Publicar respuesta del bot
             self.with_context(openai_skip=True).message_post(
@@ -100,9 +97,6 @@ class MailChannel(models.Model):
     # Triggers y detección
     # ---------------------------
     def _detect_ai_trigger(self, body_plain):
-        """
-        Detecta si el mensaje inicia con /ai y retorna (trigger, prompt)
-        """
         if not body_plain:
             return False, ''
         m = re.match(r'^\s*/ai\s*(.*)$', body_plain, re.S | re.I)
@@ -110,14 +104,23 @@ class MailChannel(models.Model):
             return True, (m.group(1) or '').strip()
         return False, ''
 
+    def _get_channel_partners(self):
+        """Compatibilidad: usa channel_member_ids en v17; si no, channel_partner_ids."""
+        if 'channel_member_ids' in self._fields:
+            return self.mapped('channel_member_ids.partner_id')
+        if 'channel_partner_ids' in self._fields:
+            return self.channel_partner_ids
+        return self.env['res.partner']
+
     def _is_dm_with_ai_bot(self):
         """
-        Retorna True si el canal es un chat 1:1 entre el usuario y el bot
+        True si el canal es un chat 1:1 entre el usuario y el bot
         """
         self.ensure_one()
-        if self.channel_type != 'chat':
+        # En v17 se mantiene channel_type='chat' para DM
+        if getattr(self, 'channel_type', None) != 'chat':
             return False
-        partners = self.channel_partner_ids
+        partners = self._get_channel_partners()
         if len(partners) != 2:
             return False
         ai_partner = self._get_or_create_ai_partner()
@@ -127,13 +130,6 @@ class MailChannel(models.Model):
     # OpenAI: preparación y llamada
     # ---------------------------
     def _prepare_openai_chat_messages(self, user_prompt, ai_partner, cfg, exclude_message_id=None):
-        """
-        Transforma el histórico del canal en mensajes para Chat Completions.
-        - Incluye system prompt
-        - Toma los últimos N mensajes (cfg['context_count'])
-        - Excluye el mensaje recién creado (exclude_message_id)
-        - Añade el user_prompt como último mensaje user
-        """
         self.ensure_one()
 
         messages = []
@@ -141,8 +137,9 @@ class MailChannel(models.Model):
         if system_prompt:
             messages.append({'role': 'system', 'content': system_prompt})
 
+        # Usar el modelo actual (discuss.channel) para el histórico
         domain = [
-            ('model', '=', 'mail.channel'),
+            ('model', '=', self._name),
             ('res_id', '=', self.id),
             ('message_type', 'in', ['comment', 'email']),
             ('body', '!=', False),
@@ -150,7 +147,6 @@ class MailChannel(models.Model):
         if exclude_message_id:
             domain.append(('id', '!=', exclude_message_id))
 
-        # Traemos los últimos N mensajes y los ordenamos ascendentemente para mantener el orden cronológico
         last_msgs = self.env['mail.message'].sudo().search(domain, order='id desc', limit=cfg['context_count'])
         for msg in reversed(last_msgs):
             role = 'assistant' if (msg.author_id and msg.author_id.id == ai_partner.id) else 'user'
@@ -159,16 +155,12 @@ class MailChannel(models.Model):
                 continue
             messages.append({'role': role, 'content': content})
 
-        # Finalmente el mensaje actual del usuario (sin /ai)
         if user_prompt:
             messages.append({'role': 'user', 'content': user_prompt})
 
         return messages
 
     def _call_openai_chat(self, messages_payload, cfg):
-        """
-        Llama a OpenAI Chat Completions API con requests para evitar dependencias extra.
-        """
         url = f"{cfg['base_url']}/chat/completions"
         headers = {
             'Authorization': f"Bearer {cfg['api_key']}",
@@ -202,9 +194,6 @@ class MailChannel(models.Model):
     # Utilidades
     # ---------------------------
     def _get_or_create_ai_partner(self):
-        """
-        Crea (si no existe) un partner para el bot, para que los mensajes se muestren con autor "AI Assistant".
-        """
         Partner = self.env['res.partner'].sudo()
         partner = Partner.search([('email', '=', AI_PARTNER_EMAIL)], limit=1)
         if partner:
