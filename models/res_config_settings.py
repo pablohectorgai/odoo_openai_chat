@@ -6,6 +6,7 @@ from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
 
+
 class ResConfigSettings(models.TransientModel):
     _inherit = 'res.config.settings'
 
@@ -104,6 +105,25 @@ class ResConfigSettings(models.TransientModel):
 
     def action_test_openai(self):
         self.ensure_one()
+        from ..services.diagnostics import run_deep_diagnostics, format_report
+        rep = run_deep_diagnostics(self.env, prompt='Di "pong".', timeout=20)
+        msg = format_report(rep)
+        notif_type = 'success' if rep.get('summary', {}).get('ok') else 'warning'
+        if rep.get('summary', {}).get('errors'):
+            notif_type = 'danger'
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': 'OpenAI Diagnostics',
+                'message': msg[:1000],
+                'type': notif_type,
+                'sticky': False,
+            }
+        }
+
+    def action_test_openai(self):
+        self.ensure_one()
         ICP = self.env['ir.config_parameter'].sudo()
         api_key = ICP.get_param('openai_chat.api_key')
         base_url = (ICP.get_param('openai_chat.base_url') or 'https://api.openai.com/v1').rstrip('/')
@@ -154,3 +174,6 @@ class ResConfigSettings(models.TransientModel):
     def _onchange_openai_base_url(self):
         if self.openai_base_url:
             self.openai_base_url = self.openai_base_url.rstrip('/')
+
+
+    
