@@ -75,36 +75,38 @@ class DiscussChannel(models.Model):
     # ---------------------------
     # Worker async (thread)
     # ---------------------------
+
+    # models/discuss_channel.py (fragmento)
     def _ai_reply_async(self, channel_id, prompt, last_user_message_id, ai_partner_id):
         import threading
         from odoo import api, SUPERUSER_ID
-
+        import odoo
+    
         dbname = self.env.cr.dbname
-
+    
         def _worker():
+            _logger.info("AI worker: start canal=%s", channel_id)
             with api.Environment.manage():
                 registry = odoo.registry(dbname)
                 with registry.cursor() as cr:
                     env = api.Environment(cr, SUPERUSER_ID, {})
                     channel = env['discuss.channel'].browse(channel_id)
-
                     try:
                         reply = channel._generate_ai_reply(prompt, exclude_message_id=last_user_message_id)
+                        if not reply:
+                            reply = _("No se pudo obtener respuesta del modelo.")
                     except Exception as e:
                         _logger.exception('AI worker error: %s', e)
                         reply = _("No se pudo obtener respuesta del modelo.")
-
-                    try:
-                        channel.with_context(openai_skip=True).message_post(
-                            body=tools.plaintext2html(reply),
-                            author_id=ai_partner_id,
-                            message_type='comment',
-                            subtype_xmlid='mail.mt_comment',
-                        )
-                        cr.commit()  # imprescindible para que el bus empuje el mensaje
-                    except Exception:
-                        _logger.exception('No se pudo publicar la respuesta del bot')
-
+                    channel.with_context(openai_skip=True).message_post(
+                        body=tools.plaintext2html(reply),
+                        author_id=ai_partner_id,
+                        message_type='comment',
+                        subtype_xmlid='mail.mt_comment',
+                    )
+                    cr.commit()
+            _logger.info("AI worker: end canal=%s", channel_id)
+    
         threading.Thread(target=_worker, name=f'openai_ai_reply_{channel_id}', daemon=True).start()
 
     def _generate_ai_reply(self, prompt, exclude_message_id=None):
