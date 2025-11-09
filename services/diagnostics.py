@@ -305,18 +305,52 @@ def run_deep_diagnostics(env, prompt='Di "pong".', channel_id=None, timeout=25) 
                 )
                 return agent
 
+
+
+
+
+
             async def _run_agent(agent, session):
                 with trace("Diag Agents Run"):
+                    # Construye RunConfig con session_input_callback si existe en esta versión
+                    try:
+                        rc = RunConfig(
+                            trace_metadata={"__trace_source__": "diag", "channel_id": str(channel.id if channel else 0)},
+                            session_input_callback=lambda hist, new: (hist or []) + (new or []),
+                        )
+                    except TypeError:
+                        rc = RunConfig(trace_metadata={"__trace_source__": "diag", "channel_id": str(channel.id if channel else 0)})
+
                     kw = dict(
                         input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-                        session=session,
-                        run_config=RunConfig(trace_metadata={"__trace_source__": "diag", "channel_id": str(channel.id if channel else 0)}),
+                        run_config=rc,
                     )
-                    # request_timeout si la firma lo soporta
+
+                    async def do_run(sess):
+                        try:
+                            return await Runner.run(
+                                agent,
+                                session=sess,
+                                request_timeout=timeout,
+                                **kw,
+                            )
+                        except TypeError:
+                            return await Runner.run(
+                                agent,
+                                session=sess,
+                                **kw,
+                            )
+
+                        # 1) con memoria
                     try:
-                        return await Runner.run(agent, request_timeout=timeout, **kw)
-                    except TypeError:
-                        return await Runner.run(agent, **kw)
+                        return await do_run(session)
+                    except Exception:
+                        # 2) sin memoria
+                        return await do_run(None)
+
+            
+
+
 
             def _run_async(coro):
                 loop = asyncio.new_event_loop()
