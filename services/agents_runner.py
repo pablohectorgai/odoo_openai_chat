@@ -3,7 +3,8 @@
 import os
 import asyncio
 import logging
-from odoo import tools
+
+from odoo import tools, _
 
 _logger = logging.getLogger(__name__)
 
@@ -11,6 +12,9 @@ class AgentsRunError(Exception):
     pass
 
 def _import_agents():
+    """
+    pip: pip install "openai-agents @ git+https://github.com/openai/openai-agents-python.git"
+    """
     try:
         from agents import (
             FileSearchTool,
@@ -25,13 +29,13 @@ def _import_agents():
         return FileSearchTool, Agent, ModelSettings, Runner, RunConfig, trace, SQLiteSession, Reasoning
     except Exception as e:
         raise AgentsRunError(
-            'Agents SDK no instalado. Ejecuta:\n'
+            "Agents SDK no instalado. Ejecuta:\n"
             'pip install "openai-agents @ git+https://github.com/openai/openai-agents-python.git"'
         ) from e
 
 def _supports_reasoning(model: str) -> bool:
     m = (model or "").lower()
-    # Los razonadores oficiales son o4, o4-mini y familia 4.1
+    # Razonadores oficiales: o4, o4-mini, gpt-4.1*
     return m.startswith("o4") or m.startswith("gpt-4.1")
 
 def _build_agent(env, model=None, with_tools=True):
@@ -47,8 +51,9 @@ def _build_agent(env, model=None, with_tools=True):
         model
         or ICP.get_param('openai_chat.agent_model')
         or ICP.get_param('openai_chat.model')
-        or 'o4-mini'
+        or 'gpt-4o-mini'
     )
+
     vec_ids_str = ICP.get_param('openai_chat.agent_vector_store_ids') or ''
     vec_ids = [v.strip() for v in vec_ids_str.split(',') if v.strip()]
 
@@ -94,13 +99,15 @@ def run_agent_for_channel(env, channel, user_prompt):
     api_key = ICP.get_param('openai_chat.api_key')
     base_url = (ICP.get_param('openai_chat.base_url') or 'https://api.openai.com/v1').rstrip('/')
     timeout = int(ICP.get_param('openai_chat.timeout') or 60)
+    fallback_model = 'gpt-4o-mini'
+
     if not api_key:
         raise AgentsRunError('Falta API Key para Agents SDK')
 
-    # Variables de entorno (el SDK suele leer estas)
+    # Variables de entorno que el SDK lee
     os.environ['OPENAI_API_KEY'] = api_key
     os.environ['OPENAI_BASE_URL'] = base_url
-    os.environ['OPENAI_API_BASE'] = base_url  # por compatibilidad
+    os.environ['OPENAI_API_BASE'] = base_url
 
     # Sesión SQLite por canal
     filestore_dir = tools.config.filestore(env.cr.dbname)
@@ -109,6 +116,7 @@ def run_agent_for_channel(env, channel, user_prompt):
     session_path = os.path.join(agents_dir, f'channel_{channel.id}.sqlite3')
     session = SQLiteSession(session_path)
 
+    # Entrada del usuario
     input_items = [
         {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}
     ]
@@ -124,43 +132,60 @@ def run_agent_for_channel(env, channel, user_prompt):
             text = getattr(result, 'final_output', None) or getattr(result, 'output', None)
         return str(text) if text is not None else ''
 
+    # Callback para fusionar memoria + nuevo input (requisito del SDK con sesiones)
+    def _merge_inputs(hist, new):
+        return (hist or []) + (new or [])
+
     async def _call(agent):
         with trace("Odoo Agents Run"):
+            # Construye RunConfig intentando incluir session_input_callback
             try:
-                return await Runner.run(
-                    agent,
-                    input=input_items,
-                    session=session,
-                    run_config=RunConfig(trace_metadata={
-                        "__trace_source__": "odoo",
-                        "channel_id": str(channel.id),
-                    }),
-                    request_timeout=timeout,
+                rc = RunConfig(
+                    trace_metadata={"__trace_source__": "odoo", "channel_id": str(channel.id)},
+                    session_input_callback=_merge_inputs,
                 )
             except TypeError:
-                # versiones que no aceptan request_timeout
-                return await Runner.run(
-                    agent,
-                    input=input_items,
-                    session=session,
-                    run_config=RunConfig(trace_metadata={
-                        "__trace_source__": "odoo",
-                        "channel_id": str(channel.id),
-                    }),
-                )
+                # Versiones del SDK sin ese campo
+                rc = RunConfig(trace_metadata={"__trace_source__": "odoo", "channel_id": str(channel.id)})
+
+            async def do_run(sess):
+                try:
+                    return await Runner.run(
+                        agent,
+                        input=input_items,
+                        session=sess,
+                        run_config=rc,
+                        request_timeout=timeout,
+                    )
+                except TypeError:
+                    # versiones que no aceptan request_timeout
+                    return await Runner.run(
+                        agent,
+                        input=input_items,
+                        session=sess,
+                        run_config=rc,
+                    )
+
+            # 1) Con memoria
+            try:
+                return await do_run(session)
+            except Exception as e:
+                # Si la versión exige session_input_callback o falla la sesión, probamos sin memoria
+                _logger.warning("Agents: fallback sin memoria por error de sesión: %s", e, exc_info=True)
+                return await do_run(None)
 
     # Estrategia en cascada:
     # 1) Modelo configurado con tools (si hay)
     # 2) Modelo configurado sin tools
-    # 3) Modelo fallback (o4-mini) con tools
+    # 3) Modelo fallback (gpt-4o-mini) con tools
     # 4) Modelo fallback sin tools
     errors = []
 
     for step, (model, with_tools) in enumerate([
         (None, True),
         (None, False),
-        ('o4-mini', True),
-        ('o4-mini', False),
+        (fallback_model, True),
+        (fallback_model, False),
     ], start=1):
         try:
             agent, had_vec = _build_agent(env, model=model, with_tools=with_tools)
