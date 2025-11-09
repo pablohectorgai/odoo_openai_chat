@@ -34,7 +34,12 @@
                                         <field name="openai_agent_mode"/>
                                         <field name="openai_assistant_id"/>
                                         <field name="openai_agent_instructions" placeholder="Instrucciones del agente (Agent Builder / Runner)" />
-
+                                        <!-- Dentro del <group name="openai_settings_group"> -->
+                                        <separator string="Agente (Agents SDK)"/>
+                                        <field name="openai_agent_mode"/>
+                                        <field name="openai_agent_instructions" invisible="[('openai_agent_mode','!=','agents')]"/>
+                                        <field name="openai_agent_model" invisible="[('openai_agent_mode','!=','agents')]" placeholder="gpt-5"/>
+                                        <field name="openai_agent_vector_store_ids" invisible="[('openai_agent_mode','!=','agents')]" placeholder="vs_...,vs_..."/>
                                         <button name="action_test_openai" type="object" string="Probar conexión" class="btn btn-secondary"/>
                                     </group>
                                 </div>
