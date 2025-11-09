@@ -1,5 +1,3 @@
-# services/diagnostics.py
-# -*- coding: utf-8 -*-
 import os
 import sys
 import time
@@ -9,7 +7,7 @@ import asyncio
 import logging
 import platform
 import inspect
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 
 import requests
 from importlib import metadata as importlib_metadata
@@ -18,6 +16,7 @@ from odoo import tools, _
 
 _logger = logging.getLogger(__name__)
 
+
 def _mask_secret(s: str) -> str:
     if not s:
         return ''
@@ -25,11 +24,13 @@ def _mask_secret(s: str) -> str:
         return '*' * len(s)
     return f"{s[:4]}***{s[-4:]}"
 
+
 def _pkg_version(name: str) -> str:
     try:
         return importlib_metadata.version(name)
     except Exception:
         return "not-installed"
+
 
 def _jsonable(obj):
     try:
@@ -37,6 +38,7 @@ def _jsonable(obj):
         return obj
     except Exception:
         return str(obj)
+
 
 def _resolve_host(url: str):
     try:
@@ -49,9 +51,12 @@ def _resolve_host(url: str):
     except Exception as e:
         return None, str(e)
 
+
 def _supports_reasoning(model: str) -> bool:
     m = (model or "").lower()
+    # Modelos con reasoning nativo
     return m.startswith("o4") or m.startswith("gpt-4.1")
+
 
 def _extract_output_text(resp) -> str:
     # Para openai.responses
@@ -70,6 +75,19 @@ def _extract_output_text(resp) -> str:
             return str(v)
     return ""
 
+
+def _safe_openai_client(api_key: str, base_url: str):
+    client = None
+    openai_version = None
+    err = None
+    try:
+        from openai import OpenAI, __version__ as openai_version
+        client = OpenAI(api_key=api_key, base_url=base_url)
+    except Exception as e:
+        err = e
+    return client, openai_version, err
+
+
 def run_deep_diagnostics(env, prompt='Di "pong".', channel_id=None, timeout=25) -> Dict[str, Any]:
     """
     Retorna un dict con diagnóstico profundo.
@@ -81,260 +99,308 @@ def run_deep_diagnostics(env, prompt='Di "pong".', channel_id=None, timeout=25) 
     - Test de filestore + SQLiteSession
     - Test del Agents Runner en 4 pasos (con/sin tools y con fallback de modelo)
     """
-    ICP = env['ir.config_parameter'].sudo()
-    api_key = ICP.get_param('openai_chat.api_key') or ''
-    base_url = (ICP.get_param('openai_chat.base_url') or 'https://api.openai.com/v1').rstrip('/')
-    agent_mode = (ICP.get_param('openai_chat.agent_mode') or 'chat').lower()
-    agent_model = ICP.get_param('openai_chat.agent_model') or ''
-    chat_model = ICP.get_param('openai_chat.model') or ''
-    assistant_id = ICP.get_param('openai_chat.assistant_id') or ''
-    vec_ids_str = ICP.get_param('openai_chat.agent_vector_store_ids') or ''
-    vec_ids = [v.strip() for v in vec_ids_str.split(',') if v.strip()]
-    fallback_model = 'o4-mini'
-
-    # Canal para sesión
-    channel = None
-    if channel_id:
-        channel = env['discuss.channel'].browse(int(channel_id))
-    if not channel:
-        channel = env['discuss.channel'].search([], limit=1)
-
-    # Info base
-    report: Dict[str, Any] = {
-        "summary": {},
-        "env_info": {
-            "python": sys.version.split()[0],
-            "platform": platform.platform(),
-            "executable": sys.executable,
-            "user": getattr(os, "geteuid", lambda: None)(),
-            "venv": os.environ.get("VIRTUAL_ENV") or "",
-            "packages": {
-                "openai": _pkg_version("openai"),
-                "openai-agents": _pkg_version("openai-agents"),
-                "httpx": _pkg_version("httpx"),
-                "requests": _pkg_version("requests"),
-                "pydantic": _pkg_version("pydantic"),
-            },
-            "env_vars": {
-                "OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL") or "",
-                "OPENAI_API_BASE": os.environ.get("OPENAI_API_BASE") or "",
-                "HTTP_PROXY": os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "",
-                "HTTPS_PROXY": os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "",
-            },
-        },
-        "config": {
-            "base_url": base_url,
-            "api_key_present": bool(api_key),
-            "api_key_sample": _mask_secret(api_key),
-            "agent_mode": agent_mode,
-            "agent_model": agent_model,
-            "chat_model": chat_model,
-            "assistant_id_present": bool(assistant_id),
-            "vector_store_ids_count": len(vec_ids),
-        },
-        "checks": [],
-    }
-
-    def add_check(name, status, duration=None, details=None, error=None, extra=None):
-        report["checks"].append({
-            "name": name,
-            "status": status,  # ok|warn|error
-            "duration": duration,
-            "details": _jsonable(details),
-            "error": (str(error) if error else None),
-            "extra": _jsonable(extra) if extra is not None else None,
-        })
-
-    # 1) Resolver host
-    ip, err = _resolve_host(base_url)
-    add_check("dns_resolve_base_url", "ok" if ip else "error", details={"ip": ip}, error=err)
-
-    # 2) Ping HTTP base_url (sin auth)
     try:
-        t0 = time.time()
-        r = requests.get(base_url, timeout=10)
-        add_check("http_ping_base_url", "ok" if r.status_code in (200, 401, 404) else "warn",
-                  duration=round(time.time() - t0, 3),
-                  details={"status_code": r.status_code})
-    except Exception as e:
-        add_check("http_ping_base_url", "error", error=e)
+        ICP = env['ir.config_parameter'].sudo()
+        api_key = ICP.get_param('openai_chat.api_key') or ''
+        base_url = (ICP.get_param('openai_chat.base_url') or 'https://api.openai.com/v1').rstrip('/')
+        agent_mode = (ICP.get_param('openai_chat.agent_mode') or 'chat').lower()
+        agent_model = ICP.get_param('openai_chat.agent_model') or ''
+        chat_model = ICP.get_param('openai_chat.model') or ''
+        assistant_id = ICP.get_param('openai_chat.assistant_id') or ''
+        vec_ids_str = ICP.get_param('openai_chat.agent_vector_store_ids') or ''
+        vec_ids = [v.strip() for v in vec_ids_str.split(',') if v.strip()]
+        fallback_model = 'o4-mini'
 
-    # 3) OpenAI client básico
-    try:
-        t0 = time.time()
-        from openai import OpenAI, __version__ as openai_version
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        models_list = client.models.list()
-        add_check("openai_models_list", "ok", duration=round(time.time() - t0, 3),
-                  details={"count": len(models_list.data), "openai_version": openai_version})
-    except Exception as e:
-        add_check("openai_models_list", "error", error=e)
+        # Canal para sesión
+        channel = None
+        if channel_id:
+            channel = env['discuss.channel'].browse(int(channel_id))
+        if not channel:
+            channel = env['discuss.channel'].search([], limit=1)
 
-    # 4) Modelo configurado (agent_model o chat_model)
-    target_model = agent_model or chat_model or ""
-    if target_model:
+        # Info base
+        report: Dict[str, Any] = {
+            "summary": {},
+            "env_info": {
+                "python": sys.version.split()[0],
+                "platform": platform.platform(),
+                "executable": sys.executable,
+                "user": getattr(os, "geteuid", lambda: None)(),
+                "venv": os.environ.get("VIRTUAL_ENV") or "",
+                "packages": {
+                    "openai": _pkg_version("openai"),
+                    "openai-agents": _pkg_version("openai-agents"),
+                    "httpx": _pkg_version("httpx"),
+                    "requests": _pkg_version("requests"),
+                    "pydantic": _pkg_version("pydantic"),
+                },
+                "env_vars": {
+                    "OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL") or "",
+                    "OPENAI_API_BASE": os.environ.get("OPENAI_API_BASE") or "",
+                    "HTTP_PROXY": os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "",
+                    "HTTPS_PROXY": os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "",
+                },
+            },
+            "config": {
+                "base_url": base_url,
+                "api_key_present": bool(api_key),
+                "api_key_sample": _mask_secret(api_key),
+                "agent_mode": agent_mode,
+                "agent_model": agent_model,
+                "chat_model": chat_model,
+                "assistant_id_present": bool(assistant_id),
+                "vector_store_ids_count": len(vec_ids),
+            },
+            "checks": [],
+        }
+
+        def add_check(name, status, duration=None, details=None, error=None, extra=None):
+            report["checks"].append({
+                "name": name,
+                "status": status,  # ok|warn|error
+                "duration": duration,
+                "details": _jsonable(details),
+                "error": (str(error) if error else None),
+                "extra": _jsonable(extra) if extra is not None else None,
+            })
+
+        # 1) Resolver host
+        ip, err = _resolve_host(base_url)
+        add_check("dns_resolve_base_url", "ok" if ip else "error", details={"ip": ip}, error=err)
+
+        # 2) Ping HTTP base_url (sin auth)
         try:
             t0 = time.time()
-            m = client.models.retrieve(target_model)
-            add_check("openai_model_retrieve", "ok", duration=round(time.time() - t0, 3),
-                      details={"id": getattr(m, "id", target_model)})
+            r = requests.get(base_url, timeout=10)
+            add_check("http_ping_base_url", "ok" if r.status_code in (200, 401, 404) else "warn",
+                      duration=round(time.time() - t0, 3),
+                      details={"status_code": r.status_code})
         except Exception as e:
-            add_check("openai_model_retrieve", "error", error=e, details={"id": target_model})
-    else:
-        add_check("openai_model_retrieve", "warn", details="no hay modelo configurado; se usará fallback")
+            add_check("http_ping_base_url", "error", error=e)
 
-    # 5) Llamada minimal de Responses (sin Agents) para validar API
-    test_model = target_model or fallback_model
-    try:
-        t0 = time.time()
-        resp = client.responses.create(model=test_model, input=prompt)
-        text = _extract_output_text(resp)
-        add_check("openai_responses_create", "ok" if bool(text) else "warn",
-                  duration=round(time.time() - t0, 3),
-                  details={"model": test_model, "output": text[:200]})
-    except Exception as e:
-        add_check("openai_responses_create", "error", error=e, details={"model": test_model})
+        # 3) OpenAI client básico
+        client = None
+        openai_version = None
+        c_err = None
+        try:
+            client, openai_version, c_err = _safe_openai_client(api_key, base_url)
+            if c_err:
+                raise c_err
+            t0 = time.time()
+            models_list = client.models.list()
+            add_check("openai_models_list", "ok", duration=round(time.time() - t0, 3),
+                      details={"count": len(models_list.data), "openai_version": openai_version})
+        except Exception as e:
+            add_check("openai_models_list", "error", error=e)
 
-    # 6) Vector stores
-    if vec_ids:
-        for vs in vec_ids:
+        # 4) Modelo configurado (agent_model o chat_model)
+        target_model = agent_model or chat_model or ""
+        if target_model and client:
             try:
                 t0 = time.time()
-                vs_obj = client.vector_stores.retrieve(vs)
-                add_check(f"vector_store_retrieve:{vs}", "ok", duration=round(time.time() - t0, 3),
-                          details={"id": getattr(vs_obj, "id", vs)})
-            except AttributeError as e:
-                add_check(f"vector_store_retrieve:{vs}", "warn", error="client.vector_stores no disponible en esta versión de openai")
-                break
+                m = client.models.retrieve(target_model)
+                add_check("openai_model_retrieve", "ok", duration=round(time.time() - t0, 3),
+                          details={"id": getattr(m, "id", target_model)})
             except Exception as e:
-                add_check(f"vector_store_retrieve:{vs}", "error", error=e)
-    else:
-        add_check("vector_stores", "warn", details="sin vector_store_ids (FileSearchTool inactivo)")
+                add_check("openai_model_retrieve", "error", error=e, details={"id": target_model})
+        elif target_model and not client:
+            add_check("openai_model_retrieve", "error", error="OpenAI client no inicializado", details={"id": target_model})
+        else:
+            add_check("openai_model_retrieve", "warn", details="no hay modelo configurado; se usará fallback")
 
-    # 7) Filestore + SQLite path
-    try:
-        filestore_dir = tools.config.filestore(env.cr.dbname)
-        agents_dir = os.path.join(filestore_dir, 'openai_agents')
-        os.makedirs(agents_dir, exist_ok=True)
-        test_file = os.path.join(agents_dir, 'diag.tmp')
-        with open(test_file, 'w') as f:
-            f.write('ok')
-        os.remove(test_file)
-        details = {"filestore": filestore_dir, "agents_dir": agents_dir}
-        add_check("filestore_write", "ok", details=details)
-    except Exception as e:
-        add_check("filestore_write", "error", error=e)
-
-    # 8) Agents SDK import + Runner.run signature
-    try:
-        from agents import FileSearchTool, Agent, ModelSettings, Runner, RunConfig, trace, SQLiteSession
-        from openai.types.shared.reasoning import Reasoning
-        sig = None
-        try:
-            sig = str(inspect.signature(Runner.run))
-        except Exception:
-            sig = "unknown"
-        add_check("agents_import", "ok", details={"Runner.run.signature": sig})
-    except Exception as e:
-        add_check("agents_import", "error", error=e)
-
-    # 9) Session SQLite
-    try:
-        filestore_dir = tools.config.filestore(env.cr.dbname)
-        session_path = os.path.join(filestore_dir, 'openai_agents', f'channel_{channel.id if channel else 0}.sqlite3')
-        # No forzamos abrir; se abrirá en Runner.run. Verificamos ruta.
-        add_check("agents_session_path", "ok", details={"session_path": session_path})
-    except Exception as e:
-        add_check("agents_session_path", "error", error=e)
-
-    # 10) Agents Runner en cascada (4 pasos)
-    def _new_agent(model=None, with_tools=True):
-        tools_list = []
-        if with_tools and vec_ids:
-            tools_list.append(FileSearchTool(vector_store_ids=vec_ids))
-        ms_kwargs = dict(store=True)
-        mdl = model or (agent_model or chat_model or fallback_model)
-        if _supports_reasoning(mdl):
+        # 5) Llamada minimal de Responses (sin Agents) para validar API
+        test_model = target_model or fallback_model
+        if client:
             try:
-                ms_kwargs['reasoning'] = Reasoning(effort="high", summary="auto")
-            except Exception:
-                pass
-        agent = Agent(
-            name="Diag Agent",
-            instructions="Eres un agente de diagnóstico; responde exactamente: pong",
-            model=mdl,
-            tools=tools_list,
-            model_settings=ModelSettings(**ms_kwargs),
-        )
-        return agent
-
-    async def _run_agent(agent, session):
-        with trace("Diag Agents Run"):
-            kw = dict(
-                input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-                session=session,
-                run_config=RunConfig(trace_metadata={"__trace_source__": "diag", "channel_id": str(channel.id if channel else 0)}),
-            )
-            # request_timeout si la firma lo soporta
-            try:
-                return await Runner.run(agent, request_timeout=timeout, **kw)
-            except TypeError:
-                return await Runner.run(agent, **kw)
-
-    def _run_async(coro):
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
-        finally:
-            try:
-                loop.stop()
-            except Exception:
-                pass
-            loop.close()
-            asyncio.set_event_loop(None)
-
-    os.environ['OPENAI_API_KEY'] = api_key or os.environ.get('OPENAI_API_KEY', '')
-    os.environ['OPENAI_BASE_URL'] = base_url
-    os.environ['OPENAI_API_BASE'] = base_url
-
-    try:
-        # Prepara session
-        filestore_dir = tools.config.filestore(env.cr.dbname)
-        agents_dir = os.path.join(filestore_dir, 'openai_agents')
-        os.makedirs(agents_dir, exist_ok=True)
-        session_path = os.path.join(agents_dir, f'channel_{channel.id if channel else 0}.sqlite3')
-        session = SQLiteSession(session_path)
-
-        steps = [
-            ("agents_step_1_model_cfg_with_tools", None, True),
-            ("agents_step_2_model_cfg_no_tools", None, False),
-            ("agents_step_3_fallback_with_tools", fallback_model, True),
-            ("agents_step_4_fallback_no_tools", fallback_model, False),
-        ]
-        for name, mdl, with_tools in steps:
-            try:
-                agent = _new_agent(model=mdl, with_tools=with_tools)
                 t0 = time.time()
-                result = _run_async(_run_agent(agent, session))
-                text = _extract_output_text(result)
-                dur = round(time.time() - t0, 3)
-                status = "ok" if text else "warn"
-                add_check(name, status, duration=dur, details={"model": agent.model, "with_tools": bool(vec_ids) and with_tools, "output": text[:200]})
+                resp = client.responses.create(model=test_model, input=prompt)
+                text = _extract_output_text(resp)
+                add_check("openai_responses_create", "ok" if bool(text) else "warn",
+                          duration=round(time.time() - t0, 3),
+                          details={"model": test_model, "output": (text or "")[:200]})
             except Exception as e:
-                add_check(name, "error", error=e, details={"model": mdl or (agent_model or chat_model or fallback_model), "with_tools": with_tools})
-    except Exception as e:
-        add_check("agents_runner_block", "error", error=e)
+                add_check("openai_responses_create", "error", error=e, details={"model": test_model})
+        else:
+            add_check("openai_responses_create", "error", error="OpenAI client no inicializado", details={"model": test_model})
 
-    # Resumen
-    errors = [c for c in report["checks"] if c["status"] == "error"]
-    warns = [c for c in report["checks"] if c["status"] == "warn"]
-    report["summary"] = {
-        "ok": len(errors) == 0,
-        "errors": len(errors),
-        "warnings": len(warns),
-    }
-    return report
+        # 6) Vector stores
+        if vec_ids and client:
+            for vs in vec_ids:
+                try:
+                    t0 = time.time()
+                    vs_obj = client.vector_stores.retrieve(vs)
+                    add_check(f"vector_store_retrieve:{vs}", "ok", duration=round(time.time() - t0, 3),
+                              details={"id": getattr(vs_obj, "id", vs)})
+                except AttributeError:
+                    add_check(f"vector_store_retrieve:{vs}", "warn",
+                              error="client.vector_stores no disponible en esta versión de openai")
+                    break
+                except Exception as e:
+                    add_check(f"vector_store_retrieve:{vs}", "error", error=e)
+        elif vec_ids and not client:
+            add_check("vector_stores", "error", error="OpenAI client no inicializado para verificar vector stores")
+        else:
+            add_check("vector_stores", "warn", details="sin vector_store_ids (FileSearchTool inactivo)")
+
+        # 7) Filestore + SQLite path
+        try:
+            filestore_dir = tools.config.filestore(env.cr.dbname)
+            agents_dir = os.path.join(filestore_dir, 'openai_agents')
+            os.makedirs(agents_dir, exist_ok=True)
+            test_file = os.path.join(agents_dir, 'diag.tmp')
+            with open(test_file, 'w') as f:
+                f.write('ok')
+            os.remove(test_file)
+            details = {"filestore": filestore_dir, "agents_dir": agents_dir}
+            add_check("filestore_write", "ok", details=details)
+        except Exception as e:
+            add_check("filestore_write", "error", error=e)
+
+        # 8) Agents SDK import + Runner.run signature
+        agents_import_ok = False
+        try:
+            from agents import FileSearchTool, Agent, ModelSettings, Runner, RunConfig, trace, SQLiteSession
+            from openai.types.shared.reasoning import Reasoning
+            sig = None
+            try:
+                sig = str(inspect.signature(Runner.run))
+            except Exception:
+                sig = "unknown"
+            add_check("agents_import", "ok", details={"Runner.run.signature": sig})
+            agents_import_ok = True
+        except Exception as e:
+            add_check("agents_import", "error", error=e)
+
+        # 9) Session SQLite
+        try:
+            filestore_dir = tools.config.filestore(env.cr.dbname)
+            session_path = os.path.join(filestore_dir, 'openai_agents', f'channel_{channel.id if channel else 0}.sqlite3')
+            add_check("agents_session_path", "ok", details={"session_path": session_path})
+        except Exception as e:
+            add_check("agents_session_path", "error", error=e)
+
+        # 10) Agents Runner en cascada (4 pasos)
+        if agents_import_ok:
+            # Import locales para usar dentro de esta sección
+            from agents import FileSearchTool, Agent, ModelSettings, Runner, RunConfig, trace, SQLiteSession
+            from openai.types.shared.reasoning import Reasoning
+
+            def _new_agent(model=None, with_tools=True):
+                tools_list = []
+                if with_tools and vec_ids:
+                    tools_list.append(FileSearchTool(vector_store_ids=vec_ids))
+                ms_kwargs = dict(store=True)
+                mdl = model or (agent_model or chat_model or fallback_model)
+                if _supports_reasoning(mdl):
+                    try:
+                        ms_kwargs['reasoning'] = Reasoning(effort="high", summary="auto")
+                    except Exception:
+                        pass
+                agent = Agent(
+                    name="Diag Agent",
+                    instructions="Eres un agente de diagnóstico; responde exactamente: pong",
+                    model=mdl,
+                    tools=tools_list,
+                    model_settings=ModelSettings(**ms_kwargs),
+                )
+                return agent
+
+            async def _run_agent(agent, session):
+                with trace("Diag Agents Run"):
+                    kw = dict(
+                        input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+                        session=session,
+                        run_config=RunConfig(trace_metadata={"__trace_source__": "diag", "channel_id": str(channel.id if channel else 0)}),
+                    )
+                    # request_timeout si la firma lo soporta
+                    try:
+                        return await Runner.run(agent, request_timeout=timeout, **kw)
+                    except TypeError:
+                        return await Runner.run(agent, **kw)
+
+            def _run_async(coro):
+                loop = asyncio.new_event_loop()
+                try:
+                    asyncio.set_event_loop(loop)
+                    return loop.run_until_complete(coro)
+                finally:
+                    try:
+                        loop.stop()
+                    except Exception:
+                        pass
+                    loop.close()
+                    asyncio.set_event_loop(None)
+
+            # Variables para SDK
+            os.environ['OPENAI_API_KEY'] = api_key or os.environ.get('OPENAI_API_KEY', '')
+            os.environ['OPENAI_BASE_URL'] = base_url
+            os.environ['OPENAI_API_BASE'] = base_url
+
+            try:
+                # Prepara session
+                filestore_dir = tools.config.filestore(env.cr.dbname)
+                agents_dir = os.path.join(filestore_dir, 'openai_agents')
+                os.makedirs(agents_dir, exist_ok=True)
+                session_path = os.path.join(agents_dir, f'channel_{channel.id if channel else 0}.sqlite3')
+                session = SQLiteSession(session_path)
+
+                steps = [
+                    ("agents_step_1_model_cfg_with_tools", None, True),
+                    ("agents_step_2_model_cfg_no_tools", None, False),
+                    ("agents_step_3_fallback_with_tools", fallback_model, True),
+                    ("agents_step_4_fallback_no_tools", fallback_model, False),
+                ]
+                for name, mdl, with_tools in steps:
+                    try:
+                        agent = _new_agent(model=mdl, with_tools=with_tools)
+                        t0 = time.time()
+                        result = _run_async(_run_agent(agent, session))
+                        text = _extract_output_text(result)
+                        dur = round(time.time() - t0, 3)
+                        status = "ok" if text else "warn"
+                        add_check(
+                            name,
+                            status,
+                            duration=dur,
+                            details={
+                                "model": agent.model,
+                                "with_tools": bool(vec_ids) and with_tools,
+                                "output": (text or "")[:200],
+                            },
+                        )
+                    except Exception as e:
+                        add_check(
+                            name,
+                            "error",
+                            error=e,
+                            details={"model": mdl or (agent_model or chat_model or fallback_model), "with_tools": with_tools},
+                        )
+            except Exception as e:
+                add_check("agents_runner_block", "error", error=e)
+        else:
+            add_check("agents_runner_block", "error", error="Agents SDK no instalado o con error de importación")
+
+        # Resumen
+        errors = [c for c in report["checks"] if c["status"] == "error"]
+        warns = [c for c in report["checks"] if c["status"] == "warn"]
+        report["summary"] = {
+            "ok": len(errors) == 0,
+            "errors": len(errors),
+            "warnings": len(warns),
+        }
+        return report
+
+    except Exception as e:
+        # Fallback ante cualquier excepción no controlada (evita HTTP 500)
+        _logger.exception("Diagnostics fatal error: %s", e)
+        return {
+            "summary": {"ok": False, "errors": 1, "warnings": 0},
+            "env_info": {},
+            "config": {},
+            "checks": [
+                {"name": "fatal_unhandled_exception", "status": "error", "error": str(e), "details": None}
+            ],
+        }
 
 
 def format_report(report: Dict[str, Any]) -> str:
@@ -362,11 +428,11 @@ def format_report(report: Dict[str, Any]) -> str:
             out = d.get("output") or ""
             if out:
                 out80 = out[:80]
-                # Sanitizar antes de interpolar (evita backslashes en f-string)
+                # Sanitizar antes de interpolar (evita backslashes en la f-string)
                 out80 = out80.replace("\n", " ").replace("\r", " ")
                 msg += f" out={out80}"
         if c.get("error"):
-            # Aquí no usamos backslashes en expresiones; es seguro
+            # Evitar backslashes en expresiones de f-string; usar format
             msg += " ERR={}".format(str(c["error"])[:200])
         lines.append(msg)
     return "\n".join(lines)
