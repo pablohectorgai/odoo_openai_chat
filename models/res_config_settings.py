@@ -84,6 +84,19 @@ class ResConfigSettings(models.TransientModel):
         config_parameter='openai_chat.agent_instructions'
     )
 
+    # Añade a models/res_config_settings.py (dentro de ResConfigSettings)
+    openai_agent_model = fields.Char(
+        string='Modelo (Agents)',
+        help='Modelo a usar solo para el modo Agents. Ej.: gpt-5, gpt-4.1, gpt-4o-mini',
+        default='gpt-4o-mini',
+        config_parameter='openai_chat.agent_model',
+    )
+    openai_agent_vector_store_ids = fields.Char(
+        string='Vector Store IDs',
+        help='IDs separados por coma (vs_...) para FileSearchTool',
+        config_parameter='openai_chat.agent_vector_store_ids',
+    )
+
     @api.onchange('openai_base_url')
     def _onchange_openai_base_url(self):
         if self.openai_base_url:
