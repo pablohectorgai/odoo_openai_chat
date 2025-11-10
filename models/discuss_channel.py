@@ -186,8 +186,7 @@ class DiscussChannel(models.Model):
                             ai_msg = channel.with_context(
                                 openai_skip=True,       # evita recursión del bot
                                 openai_skip_pin=True,   # clave: no tocar is_pinned/last_interest_dt
-                                mail_post_autofollow=False,
-                                mail_silent_followers=True,
+                                
                                 mail_create_nosubscribe=True,
                             ).message_post(
                                 body=tools.plaintext2html(reply),
