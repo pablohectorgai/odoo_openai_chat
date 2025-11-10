@@ -1,6 +1,10 @@
 import logging
 import re
 import requests
+import threading
+import time
+import psycopg2
+
 import odoo
 from odoo import api, fields, models, tools, _
 from odoo.exceptions import UserError
@@ -9,6 +13,31 @@ _logger = logging.getLogger(__name__)
 
 AI_PARTNER_NAME = 'AI Assistant'
 AI_PARTNER_EMAIL = 'assistant@openai.local'
+
+def _safe_commit(cr, logger, retries=3, delay=0.2):
+    """
+    Intentos de commit seguros ante SerializationFailure.
+    cr: cursor/transaction de OpenERP/Odoo.
+    logger: logger para registrar intentos.
+    retries: número de reintentos permitidos.
+    delay: segundos de espera entre intentos.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            cr.commit()
+            return
+        except psycopg2.errors.SerializationFailure as e:
+            logger.warning(
+                "SerializationFailure during commit (attempt %d/%d): %s",
+                attempt, retries, e
+            )
+            time.sleep(delay)
+            continue
+        except Exception as e:
+            logger.exception("Unexpected error during commit: %s", e)
+            raise
+    logger.error("Max retries exceeded for DB commit due to serialization failures.")
+    raise RuntimeError("DB commit failed due to concurrent updates. Retry exhausted.")
 
 class DiscussChannel(models.Model):
     _inherit = 'discuss.channel'  # Odoo 17
@@ -68,42 +97,41 @@ class DiscussChannel(models.Model):
     # Worker async (thread)
     # ---------------------------
 
-    # models/discuss_channel.py (fragmento)
     def _ai_reply_async(self, channel_id, prompt, placeholder_message_id, ai_partner_id):
-        import threading
-        from odoo import api, SUPERUSER_ID
         import odoo
-    
+        from odoo import api, SUPERUSER_ID
         dbname = self.env.cr.dbname
-    
+
         def _worker():
-            _logger.info("AI worker: start canal=%s, prompt_len=%d", channel_id,
-                         len(prompt) if prompt else 0)
+            _logger.info("AI worker: start canal=%s, prompt_len=%d",
+                         channel_id, len(prompt) if prompt else 0)
+
             try:
                 registry = odoo.registry(dbname)
                 with registry.cursor() as cr:
                     env = api.Environment(cr, SUPERUSER_ID, {})
                     channel = env['discuss.channel'].browse(channel_id)
+                    # Generar la respuesta
                     try:
-                        # EXCLUIR el placeholder del contexto, NO el mensaje del usuario
                         reply = channel._generate_ai_reply(prompt, exclude_message_id=placeholder_message_id)
                         if not reply:
                             reply = _("No se pudo obtener respuesta del modelo.")
                     except Exception as e:
-                        _logger.exception('AI worker error: %s', e)
+                        _logger.exception('AI worker error during generation: %s', e)
                         reply = _("No se pudo obtener respuesta del modelo.")
-    
-                    # Elimina el placeholder solo si existe y se pasó un ID válido
+
+                    # Elimina el placeholder si existiera (no se pasa placeholder_id alto en este flujo)
                     try:
                         if placeholder_message_id:
                             ph = env['mail.message'].sudo().browse(placeholder_message_id)
                             if ph.exists():
-                                ph.unlink()  # esto dispara la actualización en la UI
+                                ph.unlink()
                     except Exception as ex:
                         _logger.warning("No se pudo eliminar el placeholder %s: %s", placeholder_message_id, ex)
-    
+
                     # Publica el resultado
-                    _logger.info("Body: %s", tools.plaintext2html(reply))
+                    _logger.info("AI reply length: %d", len(reply) if reply else 0)
+                    _logger.debug("AI reply preview: %s", (reply[:200] + '...') if reply else '""')
                     try:
                         ai_msg = channel.with_context(openai_skip=True).message_post(
                             body=tools.plaintext2html(reply),
@@ -115,33 +143,36 @@ class DiscussChannel(models.Model):
                                      getattr(ai_msg, 'id', None), channel_id)
                     except Exception as post_ex:
                         _logger.exception("AI worker: fallo al publicar la respuesta: %s", post_ex)
-    
-                    cr.commit()
+
+                    # Commit con retry ante concurrencia
+                    _safe_commit(cr, _logger)
+
             except Exception as ex:
                 _logger.exception("AI worker global failure canal=%s: %s", channel_id, ex)
+
             _logger.info("AI worker: end canal=%s", channel_id)
-    
+
         threading.Thread(target=_worker, name=f'openai_ai_reply_{channel_id}', daemon=True).start()
 
+    # ---------------------------
+    # Generación de respuestas y helpers
+    # ---------------------------
 
-
-    # models/discuss_channel.py
-    
     def _generate_ai_reply(self, prompt, exclude_message_id=None):
         ICP = self.env['ir.config_parameter'].sudo()
         mode = (ICP.get_param('openai_chat.agent_mode') or 'chat').lower()
-    
+
         if mode in ('agents', 'agents_sdk'):
             try:
                 from .services.agents_runner import run_agent_for_channel
                 return run_agent_for_channel(self.env, self, prompt)
             except Exception as e:
                 _logger.warning('Fallo Agents SDK, fallback a Assistants/Chat: %s', e)
-    
+
         if mode == 'assistants':
             # Usa Assistants v2 si está seleccionado
             return self._assistants_reply(prompt) or _('No se pudo obtener respuesta del modelo.')
-    
+
         # Fallback: Chat Completions
         cfg = self._get_openai_config()
         messages_payload = self._prepare_openai_chat_messages(
@@ -151,11 +182,6 @@ class DiscussChannel(models.Model):
             exclude_message_id=exclude_message_id
         )
         return self._call_openai_chat(messages_payload=messages_payload, cfg=cfg) or _('No se pudo obtener respuesta del modelo.')
-    
-
-    
-
-    
 
     # ---------------------------
     # Assistants v2
@@ -164,7 +190,7 @@ class DiscussChannel(models.Model):
         ICP = self.env['ir.config_parameter'].sudo()
         api_key = ICP.get_param('openai_chat.api_key')
         base_url = (ICP.get_param('openai_chat.base_url') or 'https://api.openai.com/v1').rstrip('/')
-        master = ICP.get_param('openai_chat.assistant_id')
+        assistant_id = ICP.get_param('openai_chat.assistant_id')
         timeout = int(ICP.get_param('openai_chat.timeout') or 60)
 
         headers = {
@@ -183,7 +209,7 @@ class DiscussChannel(models.Model):
 
         r = requests.post(f"{base_url}/threads/{thread_id}/messages", headers=headers, json={"role": "user", "content": user_content}, timeout=timeout)
         r.raise_for_status()
-        r = requests.post(f"{base_url}/threads/{thread_id}/runs", headers=headers, json={"assistant_id": master}, timeout=timeout)
+        r = requests.post(f"{base_url}/threads/{thread_id}/runs", headers=headers, json={"assistant_id": assistant_id}, timeout=timeout)
         r.raise_for_status()
         run = r.json()
         run_id = run['id']
