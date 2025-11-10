@@ -17,7 +17,7 @@ AI_PARTNER_EMAIL = 'assistant@openai.local'
 def _safe_commit(cr, logger, retries=3, delay=0.2):
     """
     Intentos de commit seguros ante SerializationFailure o transacciones abortadas.
-    cr: cursor/transaction de OpenERP/Odoo.
+    cr: cursor/transaction de Odoo.
     logger: logger para registrar intentos.
     retries: número de reintentos permitidos.
     delay: segundos de espera entre intentos.
@@ -46,6 +46,46 @@ def _safe_commit(cr, logger, retries=3, delay=0.2):
             raise
     logger.error("Max retries exceeded for DB commit due to serialization failures.")
     raise RuntimeError("DB commit failed due to concurrent updates. Retry exhausted.")
+
+def _acquire_channel_lock(cr, channel_id, timeout=5, logger=None):
+    """
+    Intenta adquirir un lock asesorado para el canal dado.
+    Usa pg_try_advisory_lock para no bloquear si no está disponible.
+    channel_id: identificador del canal (usado como clave del lock).
+    timeout: cuánto esperar (segundos) para intentar.
+    Retorna True si se obtuvo el lock, False si no.
+    """
+    start = time.time()
+    key = int(channel_id)
+    while time.time() - start < timeout:
+        try:
+            cr.execute("SELECT pg_try_advisory_lock(%s);", (key,))
+            got = cr.fetchone()[0]
+            if got:
+                if logger:
+                    logger.debug("Advisory lock acquired for channel %s", channel_id)
+                return True
+            else:
+                time.sleep(0.2)
+        except Exception as e:
+            if logger:
+                logger.exception("Error acquiring advisory lock for channel %s: %s", channel_id, e)
+            return False
+    if logger:
+        logger.warning("Timeout while acquiring advisory lock for channel %s", channel_id)
+    return False
+
+def _release_channel_lock(cr, channel_id, logger=None):
+    """
+    Libera el lock asesorado para el canal.
+    """
+    try:
+        cr.execute("SELECT pg_advisory_unlock(%s);", (int(channel_id),))
+        if logger:
+            logger.debug("Advisory lock released for channel %s", channel_id)
+    except Exception as e:
+        if logger:
+            logger.exception("Error releasing advisory lock for channel %s: %s", channel_id, e)
 
 class DiscussChannel(models.Model):
     _inherit = 'discuss.channel'  # Odoo 17
@@ -114,9 +154,18 @@ class DiscussChannel(models.Model):
             _logger.info("AI worker: start canal=%s, prompt_len=%d",
                          channel_id, len(prompt) if prompt else 0)
 
+            registry = None
+            cr = None
+            acquired = False
             try:
                 registry = odoo.registry(dbname)
                 with registry.cursor() as cr:
+                    # Adquirir lock asesorado para el canal
+                    acquired = _acquire_channel_lock(cr, channel_id, timeout=5, logger=_logger)
+                    if not acquired:
+                        _logger.warning("No se pudo adquirir lock asesorado para canal=%s; abortando processing", channel_id)
+                        return
+
                     env = api.Environment(cr, SUPERUSER_ID, {})
                     channel = env['discuss.channel'].browse(channel_id)
 
@@ -163,6 +212,13 @@ class DiscussChannel(models.Model):
                         except Exception:
                             pass
                         return
+                    except psycopg2.errors.SerializationFailure as e:
+                        _logger.warning("SerializationFailure during commit: %s", e)
+                        try:
+                            cr.rollback()
+                        except Exception:
+                            pass
+                        return
                     except Exception as commit_ex:
                         _logger.exception("Commit final failed: %s", commit_ex)
                         try:
@@ -170,9 +226,18 @@ class DiscussChannel(models.Model):
                         except Exception:
                             pass
                         return
+                    finally:
+                        # Liberar el lock al finalizar
+                        _release_channel_lock(cr, channel_id, logger=_logger)
 
             except Exception as ex:
                 _logger.exception("AI worker global failure canal=%s: %s", channel_id, ex)
+                # Intentar liberar el lock si se tenía
+                try:
+                    if cr:
+                        _release_channel_lock(cr, channel_id, logger=_logger)
+                except Exception:
+                    pass
 
             _logger.info("AI worker: end canal=%s", channel_id)
 
