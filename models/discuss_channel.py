@@ -110,6 +110,7 @@ class DiscussChannel(models.Model):
                         _logger.warning("No se pudo eliminar el placeholder %s: %s", placeholder_message_id, ex)
     
                     # Publica el resultado
+                    _logger.info("Body: %s", tools.plaintext2html(reply))
                     channel.with_context(openai_skip=True).message_post(
                         body=tools.plaintext2html(reply),
                         author_id=ai_partner_id,
