@@ -17,7 +17,7 @@ AI_PARTNER_EMAIL = 'assistant@openai.local'
 def _safe_commit(cr, logger, retries=3, delay=0.2):
     """
     Intentos de commit seguros ante SerializationFailure o transacciones abortadas.
-    cr: cursor/transaction de Odoo.
+    cr: cursor/transaction de OpenERP/Odoo.
     logger: logger para registrar intentos.
     retries: número de reintentos permitidos.
     delay: segundos de espera entre intentos.
@@ -129,7 +129,7 @@ class DiscussChannel(models.Model):
                         _logger.exception('AI worker error during generation: %s', e)
                         reply = _("No se pudo obtener respuesta del modelo.")
 
-                    # Eliminar placeholder si existiera (no se pasa placeholder_id alto en este flujo)
+                    # Eliminar el placeholder si existiera
                     try:
                         if placeholder_message_id:
                             ph = env['mail.message'].sudo().browse(placeholder_message_id)
@@ -162,7 +162,6 @@ class DiscussChannel(models.Model):
                             cr.rollback()
                         except Exception:
                             pass
-                        _logger.error("Abortando worker canal=%s tras InFailedSqlTransaction", channel_id)
                         return
                     except Exception as commit_ex:
                         _logger.exception("Commit final failed: %s", commit_ex)
@@ -232,8 +231,7 @@ class DiscussChannel(models.Model):
             self.sudo().write({'openai_thread_id': thread_id})
             self.env.cr.commit()
 
-        r = requests.post(f"{base_url}/threads/{thread_id}/Messages" if False else f"{base_url}/threads/{thread_id}/messages",
-                          headers=headers, json={"role": "user", "content": user_content}, timeout=timeout)
+        r = requests.post(f"{base_url}/threads/{thread_id}/messages", headers=headers, json={"role": "user", "content": user_content}, timeout=timeout)
         r.raise_for_status()
         r = requests.post(f"{base_url}/threads/{thread_id}/runs", headers=headers, json={"assistant_id": assistant_id}, timeout=timeout)
         r.raise_for_status()
