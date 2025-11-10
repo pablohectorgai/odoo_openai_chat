@@ -16,7 +16,7 @@ _logger = logging.getLogger(__name__)
 AI_PARTNER_NAME = 'AI Assistant'
 AI_PARTNER_EMAIL = 'assistant@openai.local'
 
-# Namespace para locks asesorados a 2 enteros (evita colisiones con otros módulos)
+# Namespace para locks asesorados (2 enteros) para evitar colisiones con otros módulos
 ADVISORY_LOCK_NS = 987654321
 
 
@@ -31,8 +31,7 @@ def _acquire_channel_lock(cr, channel_id, timeout=5, logger=None):
                 if logger:
                     logger.debug("Advisory lock acquired for channel %s", channel_id)
                 return True
-            else:
-                time.sleep(0.2)
+            time.sleep(0.2)
         except Exception as e:
             if logger:
                 logger.exception("Error acquiring advisory lock for channel %s: %s", channel_id, e)
@@ -107,7 +106,13 @@ class DiscussChannel(models.Model):
                 )
                 self._ai_reply_async(channel_id, prompt_copy, None, ai_partner_id, dbname=dbname)
 
-            self.env.cr.after('commit', _after_commit)
+            # Usar postcommit.add (Odoo 17). Fallback a Timer si no existe (algunas builds custom)
+            postcommit = getattr(self.env.cr, 'postcommit', None)
+            if postcommit and hasattr(postcommit, 'add'):
+                postcommit.add(_after_commit)
+            else:
+                # Fallback: ejecutar ligeramente después, dando tiempo a que se confirme la tx actual
+                threading.Timer(0.1, _after_commit).start()
 
         except Exception as e:
             _logger.exception('Error al procesar respuesta de OpenAI: %s', e)
@@ -139,6 +144,12 @@ class DiscussChannel(models.Model):
             for attempt in range(1, max_attempts + 1):
                 try:
                     with registry.cursor() as cr:
+                        # Aislamiento más permisivo SOLO para esta tx del worker
+                        try:
+                            cr.execute("SET LOCAL TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                        except Exception:
+                            pass
+
                         # Lock asesorado por canal para evitar workers simultáneos del mismo canal
                         acquired = _acquire_channel_lock(cr, channel_id, timeout=5, logger=_logger)
                         if not acquired:
@@ -208,7 +219,6 @@ class DiscussChannel(models.Model):
                                 "AI worker: published message_id=%s in channel=%s (attempt %s)",
                                 ai_msg_id, channel_id, attempt
                             )
-                            # Éxito; salimos del loop
                             return
                         except psycopg2.errors.SerializationFailure as e:
                             _logger.warning(
@@ -240,7 +250,6 @@ class DiscussChannel(models.Model):
                                 pass
                             return
                         finally:
-                            # Liberar lock asesorado en este cursor
                             try:
                                 _release_channel_lock(cr, channel_id, logger=_logger)
                             except Exception:
