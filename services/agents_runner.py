@@ -1,8 +1,10 @@
+# odoo_addons/odoo_openai_chat/models/discuss_channel.py
 import logging
 import re
 import requests
 import threading
 import time
+import random
 import psycopg2
 
 import odoo
@@ -14,13 +16,17 @@ _logger = logging.getLogger(__name__)
 AI_PARTNER_NAME = 'AI Assistant'
 AI_PARTNER_EMAIL = 'assistant@openai.local'
 
+
 def _safe_commit(cr, logger, retries=3, delay=0.2):
     """
     Intentos de commit seguros ante SerializationFailure o transacciones abortadas.
     cr: cursor/transaction de Odoo.
     logger: logger para registrar intentos.
-    retries: número de reintentos permitidos.
+    retries: número de reintentos permitidos (en el mismo cursor).
     delay: segundos de espera entre intentos.
+    Nota: Si ocurre SerializationFailure en commit, lo correcto es reintentar
+    toda la transacción. Este helper intenta el commit directo pocas veces,
+    pero si falla se debe reintentar en un cursor nuevo fuera.
     """
     for attempt in range(1, retries + 1):
         try:
@@ -34,7 +40,6 @@ def _safe_commit(cr, logger, retries=3, delay=0.2):
             time.sleep(delay)
             continue
         except psycopg2.errors.InFailedSqlTransaction as e:
-            # Transacción abortada: hacer rollback y abandonar intento
             logger.error("InFailedSqlTransaction during commit (abort): %s", e)
             try:
                 cr.rollback()
@@ -47,13 +52,10 @@ def _safe_commit(cr, logger, retries=3, delay=0.2):
     logger.error("Max retries exceeded for DB commit due to serialization failures.")
     raise RuntimeError("DB commit failed due to concurrent updates. Retry exhausted.")
 
+
 def _acquire_channel_lock(cr, channel_id, timeout=5, logger=None):
     """
-    Intenta adquirir un lock asesorado para el canal dado.
-    Usa pg_try_advisory_lock para no bloquear si no está disponible.
-    channel_id: identificador del canal (usado como clave del lock).
-    timeout: cuánto esperar (segundos) para intentar.
-    Retorna True si se obtuvo el lock, False si no.
+    Lock asesorado por canal (pg_try_advisory_lock).
     """
     start = time.time()
     key = int(channel_id)
@@ -75,6 +77,7 @@ def _acquire_channel_lock(cr, channel_id, timeout=5, logger=None):
         logger.warning("Timeout while acquiring advisory lock for channel %s", channel_id)
     return False
 
+
 def _release_channel_lock(cr, channel_id, logger=None):
     """
     Libera el lock asesorado para el canal.
@@ -86,6 +89,28 @@ def _release_channel_lock(cr, channel_id, logger=None):
     except Exception as e:
         if logger:
             logger.exception("Error releasing advisory lock for channel %s: %s", channel_id, e)
+
+
+def _lock_channel_members(cr, channel_id, logger=None):
+    """
+    Aplica un bloqueo por fila a los miembros del canal para evitar
+    conflictos en discuss_channel_member al publicar mensajes.
+    Esto hace que esperemos en vez de fallar en el commit.
+    """
+    try:
+        cr.execute(
+            "SELECT id FROM discuss_channel_member WHERE channel_id = %s FOR UPDATE",
+            (int(channel_id),)
+        )
+        # También puede ayudar bloquear la fila del canal:
+        cr.execute("SELECT id FROM discuss_channel WHERE id = %s FOR UPDATE", (int(channel_id),))
+        if logger:
+            logger.debug("Row-level lock acquired on discuss_channel_member for channel %s", channel_id)
+    except Exception as e:
+        if logger:
+            logger.exception("Error locking channel members for channel %s: %s", channel_id, e)
+        raise
+
 
 class DiscussChannel(models.Model):
     _inherit = 'discuss.channel'  # Odoo 17
@@ -130,10 +155,19 @@ class DiscussChannel(models.Model):
 
             ai_partner = self._get_or_create_ai_partner()
 
-            # No crear un placeholder inicial. Invocar al worker en segundo plano sin placeholder
-            _logger.info("OpenAI: iniciando procesamiento asincrónico para canal=%s, prompt_len=%d",
-                         self.id, len(user_prompt or ''))
-            self._ai_reply_async(self.id, user_prompt, None, ai_partner.id)
+            # Diferir el worker hasta después del commit de este post
+            channel_id = self.id
+            ai_partner_id = ai_partner.id
+            prompt_copy = user_prompt
+            dbname = self.env.cr.dbname
+
+            def _after_commit():
+                _logger.info("OpenAI: iniciando procesamiento asincrónico para canal=%s, prompt_len=%d",
+                             channel_id, len(prompt_copy or ''))
+                # Lanzar el worker
+                self._ai_reply_async(channel_id, prompt_copy, None, ai_partner_id, dbname=dbname)
+
+            self.env.cr.after('commit', _after_commit)
 
         except Exception as e:
             _logger.exception('Error al procesar respuesta de OpenAI: %s', e)
@@ -145,99 +179,124 @@ class DiscussChannel(models.Model):
     # Worker async (thread)
     # ---------------------------
 
-    def _ai_reply_async(self, channel_id, prompt, placeholder_message_id, ai_partner_id):
+    def _ai_reply_async(self, channel_id, prompt, placeholder_message_id, ai_partner_id, dbname=None):
         import odoo
         from odoo import api, SUPERUSER_ID
-        dbname = self.env.cr.dbname
+        dbname = dbname or self.env.cr.dbname
 
         def _worker():
             _logger.info("AI worker: start canal=%s, prompt_len=%d",
                          channel_id, len(prompt) if prompt else 0)
 
             registry = None
-            cr = None
-            acquired = False
+            max_attempts = 3
+
             try:
                 registry = odoo.registry(dbname)
-                with registry.cursor() as cr:
-                    # Adquirir lock asesorado para el canal
-                    acquired = _acquire_channel_lock(cr, channel_id, timeout=5, logger=_logger)
-                    if not acquired:
-                        _logger.warning("No se pudo adquirir lock asesorado para canal=%s; abortando processing", channel_id)
-                        return
 
-                    env = api.Environment(cr, SUPERUSER_ID, {})
-                    channel = env['discuss.channel'].browse(channel_id)
-
-                    # Generar la respuesta
+                for attempt in range(1, max_attempts + 1):
+                    cr = None
+                    acquired = False
                     try:
-                        reply = channel._generate_ai_reply(prompt, exclude_message_id=placeholder_message_id)
-                        if not reply:
-                            reply = _("No se pudo obtener respuesta del modelo.")
-                    except Exception as e:
-                        _logger.exception('AI worker error during generation: %s', e)
-                        reply = _("No se pudo obtener respuesta del modelo.")
+                        with registry.cursor() as cr:
+                            # Adquirir lock asesorado por canal
+                            acquired = _acquire_channel_lock(cr, channel_id, timeout=5, logger=_logger)
+                            if not acquired:
+                                _logger.warning("No se pudo adquirir lock asesorado para canal=%s; abortando processing", channel_id)
+                                return
 
-                    # Eliminar el placeholder si existiera
-                    try:
-                        if placeholder_message_id:
-                            ph = env['mail.message'].sudo().browse(placeholder_message_id)
-                            if ph.exists():
-                                ph.unlink()
+                            env = api.Environment(cr, SUPERUSER_ID, {})
+                            channel = env['discuss.channel'].browse(channel_id)
+
+                            # Generar la respuesta
+                            try:
+                                reply = channel._generate_ai_reply(prompt, exclude_message_id=placeholder_message_id)
+                                if not reply:
+                                    reply = _("No se pudo obtener respuesta del modelo.")
+                            except Exception as e:
+                                _logger.exception('AI worker error during generation: %s', e)
+                                reply = _("No se pudo obtener respuesta del modelo.")
+
+                            # Eliminar el placeholder si existiera
+                            try:
+                                if placeholder_message_id:
+                                    ph = env['mail.message'].sudo().browse(placeholder_message_id)
+                                    if ph.exists():
+                                        ph.unlink()
+                            except Exception as ex:
+                                _logger.warning("No se pudo eliminar el placeholder %s: %s", placeholder_message_id, ex)
+
+                            # Bloquear filas de miembros del canal para evitar conflictos
+                            _lock_channel_members(cr, channel_id, logger=_logger)
+
+                            # Publicar el resultado
+                            _logger.info("AI reply length: %d", len(reply) if reply else 0)
+                            _logger.debug("AI reply preview: %s", (reply[:200] + '...') if reply else '""')
+
+                            ai_msg = channel.with_context(openai_skip=True).message_post(
+                                body=tools.plaintext2html(reply),
+                                author_id=ai_partner_id,
+                                message_type='comment',
+                                subtype_xmlid='mail.mt_comment',
+                            )
+                            _logger.info("AI worker: published message_id=%s in channel=%s (attempt %s)",
+                                         getattr(ai_msg, 'id', None), channel_id, attempt)
+
+                            # Commit: si hay conflicto, se captura y se reintenta toda la transacción
+                            try:
+                                cr.commit()
+                                # Éxito
+                                return
+                            except psycopg2.errors.SerializationFailure as e:
+                                _logger.warning(
+                                    "SerializationFailure during commit (attempt %d/%d) canal=%s: %s",
+                                    attempt, max_attempts, channel_id, e
+                                )
+                                try:
+                                    cr.rollback()
+                                except Exception:
+                                    pass
+                                # Liberar lock asesorado en este cursor antes de reintentar
+                                try:
+                                    _release_channel_lock(cr, channel_id, logger=_logger)
+                                except Exception:
+                                    pass
+                                # Backoff con jitter
+                                time.sleep(0.25 + random.random() * 0.25)
+                                continue
+                            except psycopg2.errors.InFailedSqlTransaction as e:
+                                _logger.error("Commit aborted due to InFailedSqlTransaction: %s", e)
+                                try:
+                                    cr.rollback()
+                                except Exception:
+                                    pass
+                                return
+                            except Exception as commit_ex:
+                                _logger.exception("Commit final failed: %s", commit_ex)
+                                try:
+                                    cr.rollback()
+                                except Exception:
+                                    pass
+                                return
+                            finally:
+                                # Liberar el lock (si aún está tomado en este cursor)
+                                try:
+                                    _release_channel_lock(cr, channel_id, logger=_logger)
+                                except Exception:
+                                    pass
+
+                    except psycopg2.errors.SerializationFailure:
+                        # Error al iniciar o durante el bloque transaccional; reintentar
+                        time.sleep(0.25 + random.random() * 0.25)
+                        continue
                     except Exception as ex:
-                        _logger.warning("No se pudo eliminar el placeholder %s: %s", placeholder_message_id, ex)
+                        _logger.exception("AI worker attempt %s/%s failure canal=%s: %s", attempt, max_attempts, channel_id, ex)
+                        return
 
-                    # Publica el resultado
-                    _logger.info("AI reply length: %d", len(reply) if reply else 0)
-                    _logger.debug("AI reply preview: %s", (reply[:200] + '...') if reply else '""')
-                    try:
-                        ai_msg = channel.with_context(openai_skip=True).message_post(
-                            body=tools.plaintext2html(reply),
-                            author_id=ai_partner_id,
-                            message_type='comment',
-                            subtype_xmlid='mail.mt_comment',
-                        )
-                        _logger.info("AI worker: published message_id=%s in channel=%s",
-                                     getattr(ai_msg, 'id', None), channel_id)
-                    except Exception as post_ex:
-                        _logger.exception("AI worker: fallo al publicar la respuesta: %s", post_ex)
-
-                    # Commit con retry ante concurrencia
-                    try:
-                        _safe_commit(cr, _logger)
-                    except psycopg2.errors.InFailedSqlTransaction as e:
-                        _logger.error("Commit aborted due to InFailedSqlTransaction: %s", e)
-                        try:
-                            cr.rollback()
-                        except Exception:
-                            pass
-                        return
-                    except psycopg2.errors.SerializationFailure as e:
-                        _logger.warning("SerializationFailure during commit: %s", e)
-                        try:
-                            cr.rollback()
-                        except Exception:
-                            pass
-                        return
-                    except Exception as commit_ex:
-                        _logger.exception("Commit final failed: %s", commit_ex)
-                        try:
-                            cr.rollback()
-                        except Exception:
-                            pass
-                        return
-                    finally:
-                        # Liberar el lock al finalizar
-                        _release_channel_lock(cr, channel_id, logger=_logger)
+                _logger.error("AI worker: max attempts exceeded for canal=%s", channel_id)
 
             except Exception as ex:
                 _logger.exception("AI worker global failure canal=%s: %s", channel_id, ex)
-                # Intentar liberar el lock si se tenía
-                try:
-                    if cr:
-                        _release_channel_lock(cr, channel_id, logger=_logger)
-                except Exception:
-                    pass
 
             _logger.info("AI worker: end canal=%s", channel_id)
 
@@ -293,17 +352,27 @@ class DiscussChannel(models.Model):
             r = requests.post(f"{base_url}/threads", headers=headers, json={}, timeout=timeout)
             r.raise_for_status()
             thread_id = r.json()['id']
+            # No commit aquí: dejamos que lo gestione la transacción del worker
             self.sudo().write({'openai_thread_id': thread_id})
-            self.env.cr.commit()
 
-        r = requests.post(f"{base_url}/threads/{thread_id}/messages", headers=headers, json={"role": "user", "content": user_content}, timeout=timeout)
+        r = requests.post(
+            f"{base_url}/threads/{thread_id}/messages",
+            headers=headers,
+            json={"role": "user", "content": user_content},
+            timeout=timeout
+        )
         r.raise_for_status()
-        r = requests.post(f"{base_url}/threads/{thread_id}/runs", headers=headers, json={"assistant_id": assistant_id}, timeout=timeout)
+
+        r = requests.post(
+            f"{base_url}/threads/{thread_id}/runs",
+            headers=headers,
+            json={"assistant_id": assistant_id},
+            timeout=timeout
+        )
         r.raise_for_status()
         run = r.json()
         run_id = run['id']
 
-        import time
         start = time.time()
         while run['status'] in ('queued', 'in_progress', 'requires_action'):
             if time.time() - start > timeout:
@@ -316,7 +385,12 @@ class DiscussChannel(models.Model):
         if run['status'] != 'completed':
             raise UserError(_('Run terminó en estado %s') % run['status'])
 
-        r = requests.get(f"{base_url}/threads/{thread_id}/messages", headers=headers, params={"order": "desc", "limit": 10}, timeout=timeout)
+        r = requests.get(
+            f"{base_url}/threads/{thread_id}/messages",
+            headers=headers,
+            params={"order": "desc", "limit": 10},
+            timeout=timeout
+        )
         r.raise_for_status()
         data = r.json()
         for msg in data.get('data', []):
