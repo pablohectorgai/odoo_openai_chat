@@ -196,6 +196,20 @@ class DiscussChannel(models.Model):
                                 subtype_xmlid='mail.mt_comment',
                             )
                             ai_msg_id = getattr(ai_msg, 'id', None)
+
+                            # enviar notificación por bus para que el cliente vea el nuevo mensaje
+                            try:
+                                # channel_id es int
+                                bus = env['bus.bus'].sudo()
+                                # el canal del bus que usa Discuss: ('<dbname>', 'mail.channel', <channel_id>)
+                                bus.sendone((cr.dbname, 'mail.channel', int(channel_id)), {
+                                    'type': 'new_message',
+                                    'channel_id': int(channel_id),
+                                    'message_id': ai_msg_id,
+                                    'body': tools.html2plaintext(reply),   # opcional: cliente puede usar body para render
+                                })
+                            except Exception as bus_ex:
+                                _logger.warning("No se pudo enviar notificación por bus: %s", bus_ex)
                         except psycopg2.errors.SerializationFailure as e:
                             _logger.warning(
                                 "SerializationFailure during message_post (attempt %d/%d) canal=%s: %s",
